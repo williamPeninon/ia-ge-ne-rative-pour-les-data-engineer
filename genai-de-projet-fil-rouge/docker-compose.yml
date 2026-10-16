@@ -1,0 +1,34 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: genai-de-ollama
+    # Pas de mapping de port vers l'hote : le service "ollama" du VM (voir fiche VM)
+    # ecoute deja sur 11434 ; le conteneur "workspace" joint celui-ci via le reseau
+    # docker interne (http://ollama:11434), sans conflit de port possible.
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: genai-de-workspace
+    depends_on:
+      ollama:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+volumes:
+  ollama_data:
