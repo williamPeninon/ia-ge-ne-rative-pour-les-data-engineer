@@ -33,13 +33,15 @@ from pydantic import BaseModel, Field, ValidationError
 
 load_dotenv()
 
+# Chemins : la source est partagee avec l'enonce, le journal d'audit reste local au corrige.
 BASE_DIR = Path(__file__).parent
 SOURCE_FILE = BASE_DIR.parent / "extrait_source.txt"
+# AUDIT_LOG_FILE permet de rediriger le journal (tests, autre disque) sans modifier le code.
 AUDIT_FILE = Path(os.environ.get("AUDIT_LOG_FILE", BASE_DIR / "logs" / "audit_tp4.jsonl"))
 
 MAX_LOG_CHARS = 300          # taille max d'un prompt/reponse ecrit dans les logs
 MAX_TENTATIVES_JSON = 3      # regenerations si la sortie JSON est invalide
-TOLERANCE_MONTANT = 0.01
+TOLERANCE_MONTANT = 0.01     # ecart accepte entre le LLM et le calcul deterministe (arrondis)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("tp4-corrige")
@@ -48,6 +50,8 @@ logger = logging.getLogger("tp4-corrige")
 # --------------------------------------------------------------------------
 # Logging / audit
 # --------------------------------------------------------------------------
+# Chaque tuple = (regex, jeton de remplacement). On masque avant d'ecrire le log
+# pour ne pas persister d'IBAN, de numero de carte, d'email ou de telephone.
 PATTERNS_SENSIBLES = [
     (re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b"), "[IBAN]"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "[CARTE]"),
@@ -60,6 +64,7 @@ def masquer_et_tronquer(texte: str, limite: int = MAX_LOG_CHARS) -> str:
     """Masque les donnees personnelles detectables puis tronque pour le log."""
     for motif, remplacement in PATTERNS_SENSIBLES:
         texte = motif.sub(remplacement, texte)
+    # On garde assez de contexte pour debugger, sans stocker le prompt entier.
     if len(texte) > limite:
         return texte[:limite] + f"... [tronque, {len(texte)} caracteres]"
     return texte
@@ -67,6 +72,7 @@ def masquer_et_tronquer(texte: str, limite: int = MAX_LOG_CHARS) -> str:
 
 def log_evenement(run_id: str, etape: str, statut: str, duree_ms: int, **champs) -> None:
     """Ecrit un evenement dans la console et dans le journal d'audit JSONL."""
+    # Schema stable : timestamp UTC, correlation, etape, statut, duree, puis champs libres.
     evenement = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "run_id": run_id,
@@ -75,11 +81,13 @@ def log_evenement(run_id: str, etape: str, statut: str, duree_ms: int, **champs)
         "duree_ms": duree_ms,
         **champs,
     }
+    # ok -> INFO, ecart de coherence -> WARNING, tout le reste (echec) -> ERROR.
     niveau = {"ok": logging.INFO, "ecart": logging.WARNING}.get(statut, logging.ERROR)
     logger.log(niveau, "run=%s etape=%s statut=%s duree_ms=%d %s",
                run_id[:8], etape, statut, duree_ms,
                " ".join(f"{k}={v}" for k, v in champs.items()))
     try:
+        # JSONL : une ligne = un evenement, facile a filtrer ensuite (jq, pandas).
         AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with AUDIT_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(evenement, ensure_ascii=False) + "\n")
@@ -91,6 +99,7 @@ def log_evenement(run_id: str, etape: str, statut: str, duree_ms: int, **champs)
 # Modele de sortie valide
 # --------------------------------------------------------------------------
 class ResumeStructure(BaseModel):
+    """Contrat de sortie du LLM. Pydantic rejette un JSON mal type ou incomplet."""
     nb_mouvements: int = Field(ge=0)
     total_depenses: float = Field(ge=0, description="somme des debits, en valeur absolue")
     total_revenus: float = Field(ge=0, description="somme des credits")
@@ -101,6 +110,7 @@ class ResumeStructure(BaseModel):
 # Client LLM
 # --------------------------------------------------------------------------
 def get_client() -> OpenAI:
+    """Client compatible OpenAI : la base_url pointe vers le LLM local ou distant."""
     return OpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"],
@@ -110,13 +120,17 @@ def get_client() -> OpenAI:
 def appeler_llm(client: OpenAI, model: str, run_id: str, etape: str,
                 messages: list[dict], **kwargs) -> str:
     """Appel LLM avec log complet : prompt, reponse, duree, tokens, statut."""
+    # On masque le prompt avant l'appel : meme un echec reseau ne doit pas le logger en clair.
     prompt_log = masquer_et_tronquer(" || ".join(m["content"] for m in messages))
     start = time.perf_counter()
     try:
+        # temperature basse : on veut une sortie stable, pas de la creativite.
+        # kwargs laisse passer response_format (JSON force) sans dupliquer la fonction.
         reponse = client.chat.completions.create(
             model=model, temperature=0.2, messages=messages, **kwargs
         )
     except Exception as exc:
+        # On journalise le type d'erreur puis on relance : l'appelant decide d'arreter.
         log_evenement(run_id, etape, "echec", int((time.perf_counter() - start) * 1000),
                       erreur=type(exc).__name__, prompt=prompt_log)
         raise
@@ -138,6 +152,7 @@ def appeler_llm(client: OpenAI, model: str, run_id: str, etape: str,
 # Etapes du pipeline
 # --------------------------------------------------------------------------
 def extraire_source(run_id: str) -> str:
+    """Lit le CSV brut. Pas d'appel LLM : l'extraction reste deterministe."""
     start = time.perf_counter()
     try:
         texte = SOURCE_FILE.read_text(encoding="utf-8")
@@ -151,6 +166,7 @@ def extraire_source(run_id: str) -> str:
 
 
 def nettoyer_assiste_par_llm(client: OpenAI, model: str, run_id: str, texte_brut: str) -> str:
+    """Normalise les libelles. Les montants, dates et signes restent intacts."""
     return appeler_llm(
         client, model, run_id, "nettoyage",
         [
@@ -168,6 +184,7 @@ def nettoyer_assiste_par_llm(client: OpenAI, model: str, run_id: str, texte_brut
 
 def generer_resume_structure(client: OpenAI, model: str, run_id: str,
                              texte_nettoye: str) -> ResumeStructure:
+    """Demande un JSON structure, puis le valide. Relance le LLM s'il est invalide."""
     messages = [
         {"role": "system", "content": (
             "Tu reponds UNIQUEMENT en JSON valide avec exactement ces champs : "
@@ -180,16 +197,19 @@ def generer_resume_structure(client: OpenAI, model: str, run_id: str,
         {"role": "user", "content": texte_nettoye},
     ]
     derniere_erreur = None
+    # Boucle de reparation : si le JSON est invalide, on renvoie l'erreur au modele.
     for tentative in range(1, MAX_TENTATIVES_JSON + 1):
         etape = "resume" if tentative == 1 else f"resume_retry{tentative - 1}"
         brut = appeler_llm(client, model, run_id, etape, messages,
                            response_format={"type": "json_object"})
         try:
+            # Double controle : JSON parsable, puis conforme au modele Pydantic.
             return ResumeStructure.model_validate(json.loads(brut))
         except (json.JSONDecodeError, ValidationError) as exc:
             derniere_erreur = exc
             log_evenement(run_id, "validation_json", "echec", 0,
                           tentative=tentative, erreur=type(exc).__name__)
+            # On ajoute la mauvaise reponse et la consigne de correction a l'historique.
             messages = messages + [
                 {"role": "assistant", "content": brut},
                 {"role": "user", "content": (
@@ -202,10 +222,13 @@ def generer_resume_structure(client: OpenAI, model: str, run_id: str,
 
 def calculer_reference(texte_brut: str) -> dict:
     """Calcul deterministe sur la source : sert de verite terrain au LLM."""
+    # On relit le CSV d'origine, pas le texte nettoye : le LLM ne doit pas
+    # pouvoir fausser la reference en modifiant un montant.
     lignes = list(csv.DictReader(io.StringIO(texte_brut), delimiter=";"))
     montants = [float(l["MONTANT"]) for l in lignes]
     return {
         "nb_mouvements": len(montants),
+        # Depenses = somme des montants negatifs, ramenee en valeur positive.
         "total_depenses": round(-sum(m for m in montants if m < 0), 2),
         "total_revenus": round(sum(m for m in montants if m > 0), 2),
     }
@@ -218,10 +241,13 @@ def controler_coherence(run_id: str, resume: ResumeStructure, texte_brut: str) -
     ecarts = []
     if resume.nb_mouvements != ref["nb_mouvements"]:
         ecarts.append("nb_mouvements")
+    # Tolerance sur les flottants : un centime d'ecart d'arrondi n'est pas une anomalie.
     for champ in ("total_depenses", "total_revenus"):
         if abs(getattr(resume, champ) - ref[champ]) > TOLERANCE_MONTANT:
             ecarts.append(champ)
 
+    # On conserve les anomalies textuelles du LLM, mais on ecrase les chiffres
+    # par ceux de la reference (update apres model_dump).
     resultat = resume.model_dump()
     resultat.update(ref)
     resultat["ecarts_llm_corriges"] = ecarts
@@ -234,17 +260,21 @@ def controler_coherence(run_id: str, resume: ResumeStructure, texte_brut: str) -
 # Orchestration
 # --------------------------------------------------------------------------
 def main() -> int:
+    # Un UUID par execution : toutes les etapes partagent ce run_id.
     run_id = str(uuid.uuid4())
     model = os.environ.get("LLM_MODEL", "mistral")
     logger.info("Demarrage du pipeline run_id=%s modele=%s", run_id, model)
     debut = time.perf_counter()
     try:
+        # Enchainement ETL : extraire -> nettoyer (LLM) -> resumer (LLM) -> controler.
         client = get_client()
         texte_brut = extraire_source(run_id)
         texte_nettoye = nettoyer_assiste_par_llm(client, model, run_id, texte_brut)
         resume = generer_resume_structure(client, model, run_id, texte_nettoye)
+        # Le controle compare le resume au CSV brut, pas au texte nettoye.
         resultat = controler_coherence(run_id, resume, texte_brut)
     except Exception as exc:
+        # Code de sortie 1 : un orchestrateur (Airflow, cron) peut detecter l'echec.
         log_evenement(run_id, "pipeline", "echec", int((time.perf_counter() - debut) * 1000),
                       erreur=type(exc).__name__)
         return 1
