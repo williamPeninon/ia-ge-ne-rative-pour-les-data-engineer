@@ -1,4 +1,4 @@
-# Squelettes TP3 / TP4 / TP5
+# Squelettes TP3 / TP4 / TP5 / TP6
 
 Scripts autonomes pour les travaux pratiques codes des Jours 2 et 3
 (independants du projet fil rouge du Jour 5). Le LLM est deja auto-heberge
@@ -31,6 +31,7 @@ LLM_MODEL=mistral
 | `tp3-appel-llm/` | TP3 : script Python pour interroger un LLM | Jour 2 matin - Module 3 |
 | `tp4-assistant-etl/` | TP4 : assistant generatif simulant un ETL (LangChain) | Jour 2 apres-midi - Module 4 |
 | `tp5-dataset-rh/` | TP5 : generation d'un dataset RH conforme RGPD | Jour 3 matin - Module 5 |
+| `tp6-evaluation-qualite/` | TP6 : evaluation qualite d'un dataset genere (metriques, anomalies, actions correctives) | Jour 3 apres-midi - Module 6 |
 
 Chaque dossier contient un script avec des `# TODO` a completer : ce sont des
 squelettes, pas des corriges. Chaque TP a aussi un sous-dossier `corrige/` avec
